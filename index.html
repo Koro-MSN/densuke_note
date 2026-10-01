@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>伝助ノート</title>
+<style>
+:root{--ink:#1b2230;--paper:#f2f4f7;--card:#fff;--line:#d5dae2;--mute:#5b6678;--acc:#3158d6;--ok:#1f7a5a;--warn:#b7791f;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root{--ink:#e8ecf3;--paper:#12161e;--card:#1b212c;--line:#323a49;--mute:#9aa6ba;--acc:#7b9bff;--ok:#4cc29a;--warn:#e2a948;--bad:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.7 "Hiragino Sans","Yu Gothic UI","Noto Sans JP",Meiryo,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px 16px 96px}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:28px 0 8px;color:var(--mute);font-weight:600}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button,input,select{font:inherit;color:inherit}
+button{padding:8px 14px;border-radius:6px;border:1px solid var(--line);background:var(--card);cursor:pointer;min-height:40px}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.q{border:0;background:none;color:var(--acc);padding:4px 8px;min-height:32px}
+button.q.d{color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+input,select{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--line);background:var(--card);min-height:40px}
+#add{display:flex;gap:8px}#add button{white-space:nowrap}
+ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+li{background:var(--card);border:1px solid var(--line);border-left:6px solid var(--mute);border-radius:6px;padding:10px 12px}
+li.ok{border-left-color:var(--ok)}li.warn{border-left-color:var(--warn)}
+.t{font-weight:600;word-break:break-all}.s{font-size:14px;color:var(--mute)}.w{color:var(--warn);font-size:14px}
+.row{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.chip{font-size:13px;border:1px solid var(--line);border-radius:99px;padding:2px 10px;color:var(--mute)}
+.chip.ok{color:var(--ok);border-color:var(--ok)}
+.steps{padding-left:1.4em;margin:12px 0}.steps li{display:list-item;list-style:decimal;background:none;border:0;border-radius:0;padding:4px 0}
+.note{font-size:14px;color:var(--mute)}
+.bar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:var(--paper);border-top:1px solid var(--line)}
+.bar button{display:block;width:100%;max-width:608px;margin:0 auto}
+.top{background:var(--warn);color:#000;text-align:center;font-size:14px;padding:6px}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);width:min(92vw,420px)}
+dialog label{display:block;margin:10px 0 2px;font-size:14px;color:var(--mute)}
+dialog menu{display:flex;gap:8px;justify-content:flex-end;margin:16px 0 0;padding:0}
+#toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:8px 14px;border-radius:6px;font-size:14px;max-width:90vw}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="net" class="top" hidden>オフラインです。変更はこの端末に保存され、接続すると同期します。</div>
+<main id="app"></main>
+<div id="toast" role="status" hidden></div>
+<dialog id="dlg">
+  <form id="dlgform">
+    <h2 style="margin:0 0 8px;color:var(--ink)">予定を確定する</h2>
+    <label for="target">どの予定ですか</label><select id="target"></select>
+    <label for="memo">予定の名前(「その他」のとき)</label><input id="memo" maxlength="60" placeholder="例: 友人との食事">
+    <label for="when">日時</label><input id="when" type="datetime-local" required>
+    <menu><button type="button" data-act="dlg-cancel">キャンセル</button><button class="p">確定する</button></menu>
+  </form>
+</dialog>
+
+<script>
+// ── 設定 ─────────────────────────────────────────────
+// Google Cloud で作った OAuth クライアントID(ウェブ)をここに入れる。空のままでも「ログインせずに試す」で動く。
+const CONFIG = { GOOGLE_CLIENT_ID: '' };
+
+// ── 小さな道具 ───────────────────────────────────────
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const now = () => Date.now();
+const KEY = 'dn:cache', STARTED = 'dn:started', PROV = 'dn:provider';
+
+function empty() { return { v: 1, pages: {}, events: {} }; }
+function loadCache() { try { return JSON.parse(localStorage.getItem(KEY)) ?? empty(); } catch { return empty(); } }
+let state = loadCache();
+
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => (t.hidden = true), 3500);
+}
+
+// 伝助のURLから cd を取り出す
+function parseCd(s) {
+  try {
+    const u = new URL(String(s).trim());
+    if (!/(^|\.)densuke\.biz$/.test(u.hostname)) return null;
+    const cd = u.searchParams.get('cd');
+    return cd ? { cd, url: `https://densuke.biz/list?cd=${encodeURIComponent(cd)}` } : null;
+  } catch { return null; }
+}
+
+// 2つの状態を、項目ごとに updatedAt が新しい方でまとめる(削除は deleted の印を残す)
+function merge(a, b) {
+  const out = empty();
+  for (const k of ['pages', 'events']) {
+    for (const src of [a[k] ?? {}, b[k] ?? {}])
+      for (const [id, x] of Object.entries(src))
+        if (!out[k][id] || (x.updatedAt ?? 0) > (out[k][id].updatedAt ?? 0)) out[k][id] = x;
+  }
+  return out;
+}
+
+// ── 保存先: この端末(常に) + Google Drive(接続中のみ) ──────────
+const loadGIS = () => window.google?.accounts ? Promise.resolve() : new Promise((res, rej) => {
+  const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client';
+  s.onload = res; s.onerror = () => rej(new Error('Googleのログイン部品を読み込めません。ネットワークを確認してください。'));
+  document.head.append(s);
+});
+
+const G = {
+  token: null, fileId: null,
+  login() {
+    return loadGIS().then(() => new Promise((res, rej) => {
+      google.accounts.oauth2.initTokenClient({
+        client_id: CONFIG.GOOGLE_CLIENT_ID,
+        scope: 'https://www.googleapis.com/auth/drive.appdata', // このアプリ専用の隠しフォルダだけ
+        callback: (r) => (r.error ? rej(new Error('Googleログインに失敗しました: ' + r.error)) : ((this.token = r.access_token), res())),
+      }).requestAccessToken();
+    }));
+  },
+  async api(url, opt = {}) {
+    const r = await fetch(url, { ...opt, headers: { Authorization: 'Bearer ' + this.token, ...(opt.headers ?? {}) } });
+    if (r.status === 401) { this.token = null; throw new Error('ログインの有効期限が切れました。「再接続」を押してください。'); }
+    if (!r.ok) throw new Error('Google Driveとの通信に失敗しました(' + r.status + ')');
+    return r;
+  },
+  async load() {
+    const q = encodeURIComponent("name='densuke-note.json'");
+    const id = (await (await this.api(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id)`)).json()).files[0]?.id;
+    if (!id) return null;
+    this.fileId = id;
+    return (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).json();
+  },
+  async save(data) {
+    const meta = { name: 'densuke-note.json', ...(this.fileId ? {} : { parents: ['appDataFolder'] }) };
+    const b = 'dn' + now();
+    const body = `--${b}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(data)}\r\n--${b}--`;
+    const url = this.fileId
+      ? `https://www.googleapis.com/upload/drive/v3/files/${this.fileId}?uploadType=multipart`
+      : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id';
+    const r = await this.api(url, { method: this.fileId ? 'PATCH' : 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + b }, body });
+    if (!this.fileId) this.fileId = (await r.json()).id;
+  },
+};
+
+let sync = 'local'; // local: この端末のみ / synced: 同期済み / pending: 未同期
+async function persist() {
+  localStorage.setItem(KEY, JSON.stringify(state));
+  if (!G.token) return;
+  if (!navigator.onLine) { sync = 'pending'; return render(); }
+  try {
+    const remote = await G.load();                 // 保存の直前に最新を取り込み、他の端末の変更を消さない
+    if (remote) { state = merge(state, remote); localStorage.setItem(KEY, JSON.stringify(state)); }
+    await G.save(state); sync = 'synced';
+  } catch (e) { sync = 'pending'; toast(e.message); }
+  render();
+}
+
+// ── 操作 ─────────────────────────────────────────────
+function addPage(url, title = '') {
+  const c = parseCd(url);
+  if (!c) throw new Error('伝助のURLとして読み取れませんでした。「https://densuke.biz/list?cd=…」の形で貼り付けてください。');
+  const ex = state.pages[c.cd];
+  if (ex && !ex.deleted) { if (title && !ex.title) { ex.title = title; ex.updatedAt = now(); persist(); } return 'exists'; }
+  state.pages[c.cd] = { cd: c.cd, url: c.url, title, addedAt: now(), updatedAt: now() };
+  persist(); return 'added';
+}
+const pageName = (p) => p.title || '(名前未設定)';
+const fmt = (s) => { const m = /(\d+)-(\d+)-(\d+)T(\d+:\d+)/.exec(s); return m ? `${+m[2]}/${+m[3]} ${m[4]}` : s; };
+const livePages = () => Object.values(state.pages).filter((p) => !p.deleted).sort((a, b) => b.addedAt - a.addedAt);
+const liveEvents = () => Object.values(state.events).filter((e) => !e.deleted).sort((a, b) => a.start.localeCompare(b.start));
+const evLabel = (e) => (e.cd && state.pages[e.cd] ? pageName(state.pages[e.cd]) : e.label || '(その他)');
+
+const actions = {
+  async 'start-google'() {
+    if (!CONFIG.GOOGLE_CLIENT_ID) return toast('Googleログインは未設定です。下の「ログインせずに試す」を使うか、設定手順を確認してください。');
+    await G.login();
+    const remote = await G.load();
+    if (remote) state = merge(state, remote);
+    localStorage.setItem(STARTED, '1'); localStorage.setItem(PROV, 'google');
+    await persist(); render();
+  },
+  'start-local'() { localStorage.setItem(STARTED, '1'); render(); },
+  async reconnect() { await actions['start-google'](); },
+  logout() { G.token = null; G.fileId = null; sync = 'local'; localStorage.removeItem(PROV); render(); toast('Googleとの接続を解除しました。データはこの端末に残っています。'); },
+  rename(cd) {
+    const v = prompt('この伝助の名前', state.pages[cd].title);
+    if (v === null) return;
+    Object.assign(state.pages[cd], { title: v.trim(), updatedAt: now() }); persist(); render();
+  },
+  del(cd) {
+    if (!confirm(`「${pageName(state.pages[cd])}」を一覧から外しますか?(伝助そのものは消えません)`)) return;
+    Object.assign(state.pages[cd], { deleted: true, updatedAt: now() }); persist(); render();
+  },
+  'del-event'(id) {
+    if (!confirm('この確定を取り消しますか?')) return;
+    Object.assign(state.events[id], { deleted: true, updatedAt: now() }); persist(); render();
+  },
+  'confirm-open'(cd) {
+    $('#target').innerHTML = livePages().map((p) => `<option value="${esc(p.cd)}">${esc(pageName(p))}</option>`).join('') + '<option value="">その他</option>';
+    if (typeof cd === 'string' && cd) $('#target').value = cd;
+    $('#memo').value = ''; $('#when').value = ''; $('#dlg').showModal();
+  },
+  'dlg-cancel'() { $('#dlg').close(); },
+};
+
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  try { await actions[b.dataset.act]?.(b.dataset.id); } catch (err) { toast(err.message); }
+});
+document.addEventListener('submit', (e) => {
+  e.preventDefault();
+  try {
+    if (e.target.id === 'add') {
+      const r = addPage(new FormData(e.target).get('url'));
+      e.target.reset(); toast(r === 'added' ? '追加しました。' : 'すでに追加されています。'); render();
+    } else if (e.target.id === 'dlgform') {
+      const cd = $('#target').value || null, label = $('#memo').value.trim();
+      if (!cd && !label) return toast('「その他」のときは予定の名前を入力してください。');
+      const id = 'e' + now();
+      state.events[id] = { id, cd, label: cd ? '' : label, start: $('#when').value, updatedAt: now() };
+      $('#dlg').close(); persist(); render(); toast('確定しました。');
+    }
+  } catch (err) { toast(err.message); }
+});
+addEventListener('online', () => { $('#net').hidden = true; if (G.token && sync === 'pending') persist(); });
+addEventListener('offline', () => { $('#net').hidden = false; });
+
+// ── 画面 ─────────────────────────────────────────────
+function renderStart() {
+  $('#app').innerHTML = `
+    <h1>伝助ノート</h1>
+    <p>いくつもの卓に手を挙げても、どの伝助に入れたか・何が確定したかを1か所で見られます。</p>
+    <ol class="steps">
+      <li><b>ログインする</b><div class="note">データはあなたのGoogle Driveのこのアプリ専用の領域だけに保存します。運営側のサーバーはありません。</div></li>
+      <li><b>伝助のURLを追加する</b><div class="note">URLを貼り付けます。拡張機能を入れると、伝助を開いたときワンクリックで追加できます。</div></li>
+      <li><b>日程が決まったら「確定」する</b><div class="note">同じ日に別の予定が入っていると、警告が出ます。</div></li>
+    </ol>
+    <p><button class="p" data-act="start-google">Googleでログイン</button></p>
+    ${CONFIG.GOOGLE_CLIENT_ID ? '' : '<p class="note">Googleログインは設定前です(README参照)。今はログインせずに試せます。</p>'}
+    <p><button data-act="start-local">ログインせずに試す</button></p>
+    <p class="note">ログインしない場合、データはこのブラウザの中だけに保存されます。あとからログインしても引き継がれます。</p>`;
+}
+
+function renderMain() {
+  const pages = livePages(), evs = liveEvents();
+  const byDay = {}; evs.forEach((e) => (byDay[e.start.slice(0, 10)] ??= []).push(e));
+  const evOf = (cd) => evs.filter((e) => e.cd === cd);
+  const chip = G.token ? (sync === 'synced' ? 'Google Driveと同期済み' : '未同期(接続後に再送します)') : 'この端末のみ';
+  const reconnect = !G.token && localStorage.getItem(PROV) === 'google' ? '<button class="q" data-act="reconnect">Googleに再接続</button>' : '';
+  const logout = G.token ? '<button class="q" data-act="logout">接続を解除</button>' : '';
+  $('#app').innerHTML = `
+    <header><h1>伝助ノート</h1><div><span class="chip ${sync === 'synced' ? 'ok' : ''}">${chip}</span>${reconnect}${logout}</div></header>
+    <form id="add"><input name="url" type="url" required placeholder="伝助のURLを貼り付け" aria-label="伝助のURL"><button class="p">追加</button></form>
+    <h2>伝助(${pages.length})</h2>
+    ${pages.length ? '<ul>' + pages.map((p) => {
+      const my = evOf(p.cd), clash = my.some((e) => byDay[e.start.slice(0, 10)].length > 1);
+      return `<li class="${clash ? 'warn' : my.length ? 'ok' : ''}">
+        <div class="t">${esc(pageName(p))}</div>
+        <div class="s">${my.length ? '確定: ' + my.map((e) => fmt(e.start)).join(', ') : '募集中'}</div>
+        <div class="row"><a class="q" href="${esc(p.url)}" target="_blank" rel="noopener"><button class="q">伝助を開く</button></a>
+          <button class="q" data-act="confirm-open" data-id="${esc(p.cd)}">確定する</button>
+          <button class="q" data-act="rename" data-id="${esc(p.cd)}">名前を付ける</button>
+          <button class="q d" data-act="del" data-id="${esc(p.cd)}">一覧から外す</button></div></li>`;
+    }).join('') + '</ul>' : '<p class="note">まだ伝助がありません。上の欄にURLを貼り付けて追加してください。</p>'}
+    ${evs.length ? '<h2>確定した予定</h2><ul>' + evs.map((e) => {
+      const same = byDay[e.start.slice(0, 10)].filter((x) => x.id !== e.id);
+      return `<li class="${same.length ? 'warn' : 'ok'}"><div class="t">${fmt(e.start)}　${esc(evLabel(e))}</div>
+        ${same.length ? `<div class="w">同じ日に別の予定があります: ${same.map((x) => esc(evLabel(x)) + ' ' + fmt(x.start).split(' ')[1]).join('、')}</div>` : ''}
+        <div class="row"><button class="q d" data-act="del-event" data-id="${esc(e.id)}">確定を取り消す</button></div></li>`;
+    }).join('') + '</ul>' : ''}
+    <div class="bar"><button class="p" data-act="confirm-open">予定を確定する</button></div>`;
+}
+
+function render() { localStorage.getItem(STARTED) ? renderMain() : renderStart(); }
+
+// 拡張機能などから ?add=<伝助のURL>&title=<名前> で渡されたURLを取り込む
+(function () {
+  const q = new URLSearchParams(location.search), u = q.get('add');
+  render();
+  if (!u) return;
+  history.replaceState(null, '', location.pathname);
+  try { const r = addPage(u, q.get('title') ?? ''); render(); toast(r === 'added' ? '伝助を追加しました。' : 'すでに追加されています。'); }
+  catch (e) { toast(e.message); }
+  if (!navigator.onLine) $('#net').hidden = false;
+})();
+</script>
+</body>
+</html>
